@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "yubinex.grok-usage",
+  "name": "Grok Usage",
+  "version": "0.1.0",
+  "author": "yubinex",
+  "license": "MIT",
+  "description": "Adds only Grok subscription limits and local CLI session usage to Omarchy's stock Agents panel.",
+  "kinds": ["service"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}

@@ -1,0 +1,309 @@
+#!/usr/bin/python3
+"""Publish one Grok record for Omarchy's stock Agents panel.
+
+Live limits come from the same authenticated Grok CLI-proxy billing endpoint
+used by Grok Build. The reported limit is account-wide, so its percentage
+includes any usage sharing that subscription pool (CLI and web). Local token
+statistics are deliberately limited to local Grok CLI session files: xAI does
+not expose web-session token totals through this endpoint.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import json
+import os
+import stat
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HOST = "cli-chat-proxy.grok.com"
+BILLING_URL = f"https://{HOST}/v1/billing?format=credits"
+SETTINGS_URL = f"https://{HOST}/v1/settings"
+MAX_AUTH_BYTES = 64 * 1024
+MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_SESSION_FILES = 400
+MAX_SESSION_BYTES = 4 * 1024 * 1024
+
+
+def grok_home() -> Path:
+    return Path(os.environ.get("GROK_HOME", Path.home() / ".grok")).expanduser()
+
+
+def usage_path() -> Path:
+    state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+    return state / "omarchy/agents/usage/grok.json"
+
+
+def read_regular_json(path: Path, maximum: int) -> dict | None:
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                return None
+            raw = stream.read(maximum + 1)
+        if len(raw) > maximum:
+            return None
+        data = json.loads(raw.decode("utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+
+
+def oauth_login() -> dict | None:
+    data = read_regular_json(grok_home() / "auth.json", MAX_AUTH_BYTES) or {}
+    candidates = []
+    for value in data.values():
+        if not isinstance(value, dict):
+            continue
+        key = str(value.get("key") or "")
+        if key and not key.startswith(("sk-", "xai-")):
+            candidates.append(value)
+    return max(candidates, key=lambda item: str(item.get("expires_at") or ""), default=None)
+
+
+def client_version() -> str:
+    version = read_regular_json(grok_home() / "version.json", 8192) or {}
+    return str(version.get("version") or "1.0.5")
+
+
+def request_json(url: str, token: str, user_id: str) -> dict:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-XAI-Token-Auth": "xai-grok-cli",
+        "x-grok-client-version": client_version(),
+        "Accept": "application/json",
+    }
+    if user_id:
+        headers["x-userid"] = user_id
+    request = urllib.request.Request(url, headers=headers)
+    # The URL is fixed above; refuse an unexpected redirect before credentials
+    # can be sent to another host.
+    opener = urllib.request.build_opener(_NoCrossHostRedirect())
+    with opener.open(request, timeout=15) as response:
+        if response.url.split("/")[2] != HOST:
+            raise ValueError("unexpected billing host")
+        raw = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raise ValueError("billing response too large")
+    data = json.loads(raw.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("invalid billing response")
+    return data
+
+
+class _NoCrossHostRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        if not newurl.startswith(f"https://{HOST}/"):
+            raise urllib.error.HTTPError(newurl, code, "cross-host redirect refused", headers, fp)
+        return super().redirect_request(request, fp, code, msg, headers, newurl)
+
+
+def iso(value: object) -> str:
+    return str(value or "")
+
+
+def cents(value: object) -> float | None:
+    try:
+        return max(0.0, float(value if not isinstance(value, dict) else value.get("val", 0)) / 100)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_limits(config: dict) -> list[dict]:
+    period = config.get("currentPeriod") if isinstance(config.get("currentPeriod"), dict) else {}
+    resets = iso(period.get("end") or config.get("billingPeriodEnd"))
+    starts = iso(period.get("start") or config.get("billingPeriodStart"))
+    percent = config.get("creditUsagePercent")
+    try:
+        used = min(1.0, max(0.0, float(percent) / 100)) if percent is not None else None
+    except (TypeError, ValueError):
+        used = None
+    if used is None:
+        spent, cap = cents(config.get("used")), cents(config.get("monthlyLimit"))
+        used = min(1.0, spent / cap) if spent is not None and cap else None
+    limits = []
+    if used is not None:
+        limits.append({"label": "Weekly SuperGrok limit", "percent": used, "resetsAt": resets, "startsAt": starts})
+    return limits
+
+
+def tier(token: str, settings: dict) -> str:
+    for key in ("subscription_tier_display", "subscriptionTierDisplay", "subscription_tier"):
+        if settings.get(key):
+            return str(settings[key])
+    try:
+        body = token.split(".")[1] + "==="
+        value = json.loads(base64.urlsafe_b64decode(body))
+        return {"3": "SuperGrok", "4": "SuperGrok Plus", "5": "SuperGrok Heavy"}.get(str(value.get("tier")), "")
+    except (IndexError, ValueError, UnicodeError):
+        return ""
+
+
+def number(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def empty_usage_bucket() -> dict:
+    return {"inputTokens": 0, "outputTokens": 0, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}
+
+
+def local_day(timestamp: object) -> str:
+    try:
+        seconds = float(timestamp)
+        if seconds > 10_000_000_000:
+            seconds /= 1000
+        return dt.datetime.fromtimestamp(seconds).astimezone().date().isoformat()
+    except (TypeError, ValueError, OSError):
+        return dt.datetime.now().date().isoformat()
+
+
+def local_usage() -> dict:
+    """Aggregate completed local Grok CLI turns; web usage is not available."""
+    today = dt.datetime.now().date()
+    dates = [(today - dt.timedelta(days=offset)).isoformat() for offset in range(6, -1, -1)]
+    days = {day: {"date": day, "messageCount": 0} for day in dates}
+    models: dict[str, dict] = {}
+    today_models: dict[str, int] = {}
+    seen, sessions, active_days, today_sessions = set(), set(), set(), set()
+    total_prompts = total_today = today_prompts = 0
+
+    root = grok_home() / "sessions"
+    files_seen = 0
+    if root.is_dir() and not root.is_symlink():
+        for directory, subdirectories, filenames in os.walk(root, followlinks=False):
+            subdirectories[:] = [name for name in subdirectories if not os.path.islink(os.path.join(directory, name))]
+            if "updates.jsonl" not in filenames:
+                continue
+            path = Path(directory) / "updates.jsonl"
+            files_seen += 1
+            if files_seen > MAX_SESSION_FILES:
+                break
+            try:
+                if path.is_symlink() or path.stat().st_size > MAX_SESSION_BYTES:
+                    continue
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            session = path.parent.name
+            for line in lines:
+                if "turn_completed" not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                    update = event["params"]["update"]
+                    if update.get("sessionUpdate") != "turn_completed":
+                        continue
+                    prompt_id = str(update.get("prompt_id") or "")
+                    unique = f"{session}:{prompt_id}" if prompt_id else line
+                    if unique in seen:
+                        continue
+                    usage = update.get("usage") or {}
+                    rows = usage.get("modelUsage") if isinstance(usage.get("modelUsage"), dict) else {"grok": usage}
+                    day = local_day(event.get("timestamp"))
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                turn_total = 0
+                for model, values in rows.items():
+                    if not isinstance(values, dict):
+                        continue
+                    cached = number(values.get("cachedReadTokens"))
+                    created = number(values.get("cacheCreationTokens"))
+                    input_tokens = max(0, number(values.get("inputTokens")) - cached - created)
+                    output_tokens = number(values.get("outputTokens"))
+                    amount = input_tokens + output_tokens + cached + created
+                    if not amount:
+                        continue
+                    bucket = models.setdefault(str(model or "grok"), empty_usage_bucket())
+                    bucket["inputTokens"] += input_tokens
+                    bucket["outputTokens"] += output_tokens
+                    bucket["cacheReadInputTokens"] += cached
+                    bucket["cacheCreationInputTokens"] += created
+                    turn_total += amount
+                    if day == today.isoformat():
+                        today_models[str(model or "grok")] = today_models.get(str(model or "grok"), 0) + amount
+                if not turn_total:
+                    continue
+                seen.add(unique)
+                sessions.add(session)
+                active_days.add(day)
+                total_prompts += 1
+                if day in days:
+                    days[day]["messageCount"] += turn_total
+                if day == today.isoformat():
+                    today_prompts += 1
+                    total_today += turn_total
+                    today_sessions.add(session)
+    return {
+        "hasLocalStats": True, "hasPromptStats": total_prompts > 0,
+        "todayPrompts": today_prompts, "todaySessions": len(today_sessions),
+        "todayTotalTokens": total_today, "todayTokensByModel": today_models,
+        "recentDays": [days[day] for day in dates], "totalPrompts": total_prompts,
+        "totalSessions": len(sessions), "activeDays": len(active_days),
+        "activeDates": sorted(active_days), "modelUsage": models,
+    }
+
+
+def collect() -> dict:
+    record = {
+        "schemaVersion": 1, "id": "grok", "name": "Grok",
+        "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "ready": False,
+        "limits": [], "authHelpText": "Run `grok login` to connect Grok usage.",
+    }
+    record.update(local_usage())
+    login = oauth_login()
+    if not login:
+        record["usageStatusText"] = "Waiting for Grok sign-in"
+        return record
+    try:
+        token, user_id = str(login["key"]), str(login.get("user_id") or "")
+        billing = request_json(BILLING_URL, token, user_id)
+        config = billing.get("config")
+        if not isinstance(config, dict):
+            raise ValueError("billing returned no limits")
+        settings = request_json(SETTINGS_URL, token, user_id)
+        record["limits"] = parse_limits(config)
+        record["tierLabel"] = tier(token, settings)
+        record["ready"] = bool(record["limits"])
+        record["authHelpText"] = ""
+        if not record["ready"]:
+            record["usageStatusText"] = "Grok returned no subscription limits"
+    except urllib.error.HTTPError as error:
+        record["usageStatusText"] = "Grok limits unavailable"
+        record["authHelpText"] = "Run `grok login` again." if error.code in (401, 403) else f"Grok billing returned status {error.code}."
+    except Exception as error:
+        record["usageStatusText"] = "Grok limits unavailable"
+        record["authHelpText"] = str(error)
+    return record
+
+
+def write_record(record: dict) -> None:
+    destination = usage_path()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=destination.parent, delete=False) as stream:
+        os.chmod(stream.name, 0o600)
+        json.dump(record, stream, separators=(",", ":"))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        temporary = stream.name
+    os.replace(temporary, destination)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--write", action="store_true")
+    arguments = parser.parse_args()
+    result = collect()
+    if arguments.write:
+        write_record(result)
+    print(json.dumps(result, separators=(",", ":")))
