@@ -3,7 +3,9 @@
 
 Live limits come from the same authenticated Grok CLI-proxy billing endpoint
 used by Grok Build. The reported limit is account-wide, so its percentage
-includes any usage sharing that subscription pool (CLI and web). Local token
+includes any usage sharing that subscription pool (CLI and web), and the
+per-product breakdown (Grok Build, Grok Chat, ...) is published alongside it,
+together with on-demand spend and prepaid credits when the account has any. Local token
 statistics are deliberately limited to local Grok CLI session files: xAI does
 not expose web-session token totals through this endpoint.
 """
@@ -15,6 +17,7 @@ import base64
 import datetime as dt
 import json
 import os
+import re
 import stat
 import tempfile
 import urllib.error
@@ -129,8 +132,33 @@ def parse_limits(config: dict) -> list[dict]:
         used = min(1.0, spent / cap) if spent is not None and cap else None
     limits = []
     if used is not None:
-        limits.append({"label": "Weekly SuperGrok limit", "percent": used, "resetsAt": resets, "startsAt": starts})
+        limits.append({"label": "Weekly SuperGrok limit", "title": "Weekly", "percent": used, "resetsAt": resets, "startsAt": starts})
+    # Each product's share of the same weekly pool (Grok Build, Grok Chat on
+    # web and apps, ...). They share the total's reset, so it is shown once.
+    for entry in config.get("productUsage") or []:
+        if not isinstance(entry, dict) or not entry.get("product"):
+            continue
+        try:
+            share = min(1.0, max(0.0, float(entry.get("usagePercent") or 0) / 100))
+        except (TypeError, ValueError):
+            continue
+        limits.append({"label": f"{product_name(entry['product'])} usage", "title": product_name(entry["product"]), "percent": share})
+    spent, cap = cents(config.get("onDemandUsed")), cents(config.get("onDemandCap"))
+    if spent is not None and cap:
+        limits.append({"label": "On-demand spend", "title": "On-demand", "percent": min(1.0, spent / cap), "resetsAt": resets})
     return limits
+
+
+def product_name(product: object) -> str:
+    """GrokBuild -> Grok Build."""
+    return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", str(product))
+
+
+def prepaid_balance(config: dict) -> dict | None:
+    remaining = cents(config.get("prepaidBalance"))
+    if not remaining:
+        return None
+    return {"remaining": remaining, "funded": 0, "spent": 0, "currency": "USD"}
 
 
 def tier(token: str, settings: dict) -> str:
@@ -272,6 +300,9 @@ def collect() -> dict:
             raise ValueError("billing returned no limits")
         settings = request_json(SETTINGS_URL, token, user_id)
         record["limits"] = parse_limits(config)
+        balance = prepaid_balance(config)
+        if balance:
+            record["balance"] = balance
         record["tierLabel"] = tier(token, settings)
         record["ready"] = bool(record["limits"])
         record["authHelpText"] = ""
