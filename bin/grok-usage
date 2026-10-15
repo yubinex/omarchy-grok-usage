@@ -18,7 +18,9 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import stat
+import subprocess
 import tempfile
 import urllib.error
 import urllib.request
@@ -68,6 +70,29 @@ def oauth_login() -> dict | None:
         if key and not key.startswith(("sk-", "xai-")):
             candidates.append(value)
     return max(candidates, key=lambda item: str(item.get("expires_at") or ""), default=None)
+
+
+# Grok access tokens last about six hours and only the CLI rotates them, so
+# an idle machine finds the saved one lapsed. Any authenticated CLI command
+# refreshes auth.json under its own lock; `grok models` is the cheapest.
+def refresh_login() -> dict | None:
+    grok = shutil.which("grok") or str(grok_home() / "bin/grok")
+    try:
+        subprocess.run([grok, "models"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return oauth_login()
+
+
+def login_expiring(login: dict) -> bool:
+    try:
+        expires = dt.datetime.fromisoformat(re.sub(r"(\.\d{6})\d+", r"\1", str(login.get("expires_at") or "")).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=dt.timezone.utc)
+    return expires <= dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)
 
 
 def client_version() -> str:
@@ -289,12 +314,21 @@ def collect() -> dict:
     }
     record.update(local_usage())
     login = oauth_login()
+    if login and login_expiring(login):
+        login = refresh_login()
     if not login:
         record["usageStatusText"] = "Waiting for Grok sign-in"
         return record
     try:
         token, user_id = str(login["key"]), str(login.get("user_id") or "")
-        billing = request_json(BILLING_URL, token, user_id)
+        try:
+            billing = request_json(BILLING_URL, token, user_id)
+        except urllib.error.HTTPError as error:
+            # A token revoked before its expiry: let the CLI refresh once.
+            if error.code not in (401, 403) or not (login := refresh_login()):
+                raise
+            token, user_id = str(login["key"]), str(login.get("user_id") or "")
+            billing = request_json(BILLING_URL, token, user_id)
         config = billing.get("config")
         if not isinstance(config, dict):
             raise ValueError("billing returned no limits")
