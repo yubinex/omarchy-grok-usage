@@ -6,7 +6,7 @@ bar icon or replacing the Claude and Codex UI.
 The tab shows your SuperGrok tier, the live weekly subscription limit and
 reset time, how much of that limit each product used (Grok Build, Grok Chat on
 web and apps, and any others xAI reports), on-demand spend and prepaid credits
-when your account has them, plus local Grok Build token totals by day and model.
+when your account has them.
 
 ## Installation
 
@@ -37,11 +37,10 @@ omarchy restart shell
 | Subscription tier, weekly limit, and reset | Grok Build's authenticated billing endpoint | Account-wide shared subscription pool, including web and app use. |
 | Per-product usage (Grok Build, Grok Chat, ...) | Same billing endpoint | Each product's share of the weekly pool, as whole percentages. |
 | On-demand spend and prepaid credits | Same billing endpoint | Shown only when the account has an on-demand cap or a prepaid balance. |
-| Token charts, prompts, and sessions | `~/.grok/sessions/**/updates.jsonl` | Local Grok Build CLI sessions only. |
 
-xAI does not expose web-session token totals through the billing endpoint, so
-the token charts intentionally do not claim to include browser use. The
-weekly limit is still the authoritative remaining allowance.
+Token charts are intentionally omitted. Local session records cannot be counted
+reliably and do not cover web or app use, so the billing limits are the only
+usage figure shown.
 
 The collector uses the existing Grok login at `~/.grok/auth.json`. Credentials
 are never written to Omarchy's usage record, printed, or sent anywhere except

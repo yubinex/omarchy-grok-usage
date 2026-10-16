@@ -5,9 +5,9 @@ Live limits come from the same authenticated Grok CLI-proxy billing endpoint
 used by Grok Build. The reported limit is account-wide, so its percentage
 includes any usage sharing that subscription pool (CLI and web), and the
 per-product breakdown (Grok Build, Grok Chat, ...) is published alongside it,
-together with on-demand spend and prepaid credits when the account has any. Local token
-statistics are deliberately limited to local Grok CLI session files: xAI does
-not expose web-session token totals through this endpoint.
+together with on-demand spend and prepaid credits when the account has any. Token
+statistics are not published: local session records cannot be counted reliably,
+and the billing limits are the authoritative usage figure.
 """
 
 from __future__ import annotations
@@ -31,8 +31,6 @@ BILLING_URL = f"https://{HOST}/v1/billing?format=credits"
 SETTINGS_URL = f"https://{HOST}/v1/settings"
 MAX_AUTH_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
-MAX_SESSION_FILES = 400
-MAX_SESSION_BYTES = 4 * 1024 * 1024
 
 
 def grok_home() -> Path:
@@ -198,121 +196,15 @@ def tier(token: str, settings: dict) -> str:
         return ""
 
 
-def number(value: object) -> int:
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def empty_usage_bucket() -> dict:
-    return {"inputTokens": 0, "outputTokens": 0, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}
-
-
-def local_day(timestamp: object) -> str:
-    try:
-        seconds = float(timestamp)
-        if seconds > 10_000_000_000:
-            seconds /= 1000
-        return dt.datetime.fromtimestamp(seconds).astimezone().date().isoformat()
-    except (TypeError, ValueError, OSError):
-        return dt.datetime.now().date().isoformat()
-
-
-def local_usage() -> dict:
-    """Aggregate completed local Grok CLI turns; web usage is not available."""
-    today = dt.datetime.now().date()
-    dates = [(today - dt.timedelta(days=offset)).isoformat() for offset in range(6, -1, -1)]
-    days = {day: {"date": day, "messageCount": 0} for day in dates}
-    models: dict[str, dict] = {}
-    today_models: dict[str, int] = {}
-    seen, sessions, active_days, today_sessions = set(), set(), set(), set()
-    total_prompts = total_today = today_prompts = 0
-
-    root = grok_home() / "sessions"
-    files_seen = 0
-    if root.is_dir() and not root.is_symlink():
-        for directory, subdirectories, filenames in os.walk(root, followlinks=False):
-            subdirectories[:] = [name for name in subdirectories if not os.path.islink(os.path.join(directory, name))]
-            if "updates.jsonl" not in filenames:
-                continue
-            path = Path(directory) / "updates.jsonl"
-            files_seen += 1
-            if files_seen > MAX_SESSION_FILES:
-                break
-            try:
-                if path.is_symlink() or path.stat().st_size > MAX_SESSION_BYTES:
-                    continue
-                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError:
-                continue
-            session = path.parent.name
-            for line in lines:
-                if "turn_completed" not in line:
-                    continue
-                try:
-                    event = json.loads(line)
-                    update = event["params"]["update"]
-                    if update.get("sessionUpdate") != "turn_completed":
-                        continue
-                    prompt_id = str(update.get("prompt_id") or "")
-                    unique = f"{session}:{prompt_id}" if prompt_id else line
-                    if unique in seen:
-                        continue
-                    usage = update.get("usage") or {}
-                    rows = usage.get("modelUsage") if isinstance(usage.get("modelUsage"), dict) else {"grok": usage}
-                    day = local_day(event.get("timestamp"))
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                    continue
-                turn_total = 0
-                for model, values in rows.items():
-                    if not isinstance(values, dict):
-                        continue
-                    cached = number(values.get("cachedReadTokens"))
-                    created = number(values.get("cacheCreationTokens"))
-                    input_tokens = max(0, number(values.get("inputTokens")) - cached - created)
-                    output_tokens = number(values.get("outputTokens"))
-                    amount = input_tokens + output_tokens + cached + created
-                    if not amount:
-                        continue
-                    bucket = models.setdefault(str(model or "grok"), empty_usage_bucket())
-                    bucket["inputTokens"] += input_tokens
-                    bucket["outputTokens"] += output_tokens
-                    bucket["cacheReadInputTokens"] += cached
-                    bucket["cacheCreationInputTokens"] += created
-                    turn_total += amount
-                    if day == today.isoformat():
-                        today_models[str(model or "grok")] = today_models.get(str(model or "grok"), 0) + amount
-                if not turn_total:
-                    continue
-                seen.add(unique)
-                sessions.add(session)
-                active_days.add(day)
-                total_prompts += 1
-                if day in days:
-                    days[day]["messageCount"] += turn_total
-                if day == today.isoformat():
-                    today_prompts += 1
-                    total_today += turn_total
-                    today_sessions.add(session)
-    return {
-        "hasLocalStats": True, "hasPromptStats": total_prompts > 0,
-        "todayPrompts": today_prompts, "todaySessions": len(today_sessions),
-        "todayTotalTokens": total_today, "todayTokensByModel": today_models,
-        "recentDays": [days[day] for day in dates], "totalPrompts": total_prompts,
-        "totalSessions": len(sessions), "activeDays": len(active_days),
-        "activeDates": sorted(active_days), "modelUsage": models,
-    }
-
-
 def collect() -> dict:
     record = {
         "schemaVersion": 1, "id": "grok", "name": "Grok",
         "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
         "ready": False,
         "limits": [], "authHelpText": "Run `grok login` to connect Grok usage.",
+        # Hides the panel's token charts and prompt/session counts.
+        "hasLocalStats": False, "hasPromptStats": False,
     }
-    record.update(local_usage())
     login = oauth_login()
     if login and login_expiring(login):
         login = refresh_login()
